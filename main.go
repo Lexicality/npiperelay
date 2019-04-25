@@ -42,7 +42,7 @@ func main() {
 
 	flag.Parse()
 
-	var conn net.Conn
+	var conn io.ReadWriteCloser
 	var err error
 
 	if *namedPipe != "" {
@@ -80,6 +80,7 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
+	defer conn.Close()
 
 	if *verbose {
 		log.Println("connected")
