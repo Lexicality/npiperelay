@@ -1,14 +1,17 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Microsoft/go-winio"
 	flag "github.com/spf13/pflag"
 	"golang.org/x/sys/windows"
 )
@@ -24,6 +27,7 @@ var (
 	verbose         = flag.BoolP("verbose", "v", false, "verbose output on stderr")
 	namedPipe       = flag.String("pipe", "", "The name of the pipe you wish to connect to")
 	gpgFile         = flag.String("gpg", "", "To location of your windows GPG agent socket")
+	targetPipe      = flag.StringP("target-pipe", "t", "", "The name of the new pipe to create")
 )
 
 func underlyingError(err error) error {
@@ -42,20 +46,43 @@ func main() {
 
 	flag.Parse()
 
-	var conn io.ReadWriteCloser
+	if *targetPipe == "" {
+		log.Fatalf("Pipe name is required")
+	} else if strings.Contains(*targetPipe, `\`) {
+		log.Fatalf(`Pipe name must not contain \!`)
+	}
+	var pipe = fmt.Sprintf(`\\.\pipe\%s`, *targetPipe)
+
+	l, err := winio.ListenPipe(pipe, nil)
+	if err != nil {
+		log.Fatalf("Cannot open pipe: %s", err)
+	}
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Fatalf("Failure accetping a new pipe connection: %s", err)
+		}
+		go onCon(conn)
+	}
+}
+
+func onCon(targetConn net.Conn) {
+	defer targetConn.Close()
+
+	var sourceConn io.ReadWriteCloser
 	var err error
 
 	if *namedPipe != "" {
 		if *verbose {
 			log.Println("Creating a pipe to", *namedPipe)
 		}
-		conn, err = dialPipe(*namedPipe, *poll)
+		sourceConn, err = dialPipe(*namedPipe, *poll)
 	} else if *gpgFile != "" {
 		fileName := *gpgFile
 		if !filepath.IsAbs(fileName) {
 			appdata, ok := os.LookupEnv("APPDATA")
 			if !ok {
-				log.Fatal("Missing the %APPDATA% variable?")
+				log.Fatal("Missing the %%APPDATA%% variable?")
 			}
 			gpgDir := filepath.Join(appdata, "gnupg")
 			_, err := os.Stat(gpgDir)
@@ -70,7 +97,7 @@ func main() {
 			log.Println("Opening an Assuan connection via", fileName)
 		}
 
-		conn, err = dialAssuan(fileName, *poll)
+		sourceConn, err = dialAssuan(fileName, *poll)
 	} else {
 		log.Fatalln("No action specified!")
 		flag.Usage()
@@ -80,7 +107,7 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-	defer conn.Close()
+	defer sourceConn.Close()
 
 	if *verbose {
 		log.Println("connected")
@@ -89,7 +116,7 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
-		_, err := io.Copy(conn, os.Stdin)
+		_, err := io.Copy(sourceConn, targetConn)
 		if err != nil {
 			log.Fatalln("copy from stdin to pipe failed:", err)
 		}
@@ -103,7 +130,7 @@ func main() {
 		}
 
 		if *closeWrite {
-			cw, ok := conn.(closeWriter)
+			cw, ok := sourceConn.(closeWriter)
 			if ok {
 				err = cw.CloseWrite()
 				if err != nil {
@@ -117,7 +144,7 @@ func main() {
 		wg.Done()
 	}()
 
-	_, err = io.Copy(os.Stdout, conn)
+	_, err = io.Copy(targetConn, sourceConn)
 	if underlyingError(err) == windows.ERROR_BROKEN_PIPE || underlyingError(err) == windows.ERROR_PIPE_NOT_CONNECTED {
 		// The named pipe is closed and there is no more data to read. Since
 		// named pipes are not bidirectional, there is no way for the other side
@@ -138,13 +165,13 @@ func main() {
 	}
 
 	if !*closeOnEOF {
-		os.Stdout.Close()
+		targetConn.Close()
 
 		// Keep reading until we get ERROR_BROKEN_PIPE or the copy from stdin
 		// finishes.
 		go func() {
 			for {
-				_, err := conn.Read(nil)
+				_, err := sourceConn.Read(nil)
 				if underlyingError(err) == windows.ERROR_BROKEN_PIPE {
 					if *verbose {
 						log.Println("pipe closed")
